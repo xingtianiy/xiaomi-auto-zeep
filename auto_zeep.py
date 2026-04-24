@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Zepp Life 小米运动 最新原生API
-修复旧登录接口失效、签名缺失、登录失败:None 问题
-"""
+
 import requests
 import random
 import time
@@ -11,12 +8,12 @@ import json
 import logging
 from datetime import datetime
 import os
-import hashlib
+import re
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ==================== 读取账号（完全不变） ====================
+# ==================== 账号配置 ====================
 def get_accounts_from_env():
     accounts = []
     for i in range(1, 6):
@@ -24,14 +21,14 @@ def get_accounts_from_env():
         password = os.getenv(f'ACCOUNT{i}_PASSWORD')
         if username and password:
             accounts.append({"username": username, "password": password})
-            logger.info(f"✅ 成功加载账号 {i}: {username}")
+            logger.info(f"✅ 加载账号 {i}: {username}")
     if not accounts:
-        logger.warning("⚠️ 未找到任何账号环境变量配置")
+        logger.warning("⚠️ 未找到账号配置")
     return accounts
 
 ACCOUNTS = get_accounts_from_env()
 
-# ==================== 步数规则（保留你原版） ====================
+# ==================== 步数规则 ====================
 STEP_RANGES = {
     8: {"min": 6000, "max": 10000},
     12: {"min": 8000, "max": 14000},
@@ -39,150 +36,181 @@ STEP_RANGES = {
     20: {"min": 12000, "max": 22000},
     22: {"min": 15000, "max": 24000}
 }
-DEFAULT_STEPS = 24465
 
-# ==================== 修复版 官方API 核心类 ====================
-class ZeppLifeApi:
-    BASE_URL = "https://api-mifit.huami.com"
-    APP_KEY = "huami20150403"
-    APP_SECRET = "a2b7d0967d4e8f1c3a5b902f76e4d123"
+DEFAULT_STEPS = 20000
+
+# ==================== 核心类 ====================
+class XiaomiClient:
 
     def __init__(self):
         self.session = requests.Session()
-        self.device_id = self.random_device_id()
-        self.access_token = ""
-        self.user_id = ""
         self.headers = {
-            "User-Agent": "ZeppLife/7.10.0 (Linux; Android 13)",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept-Encoding": "gzip"
+            "User-Agent": "Mozilla/5.0",
+            "Content-Type": "application/x-www-form-urlencoded"
         }
 
-    @staticmethod
-    def random_device_id():
-        return "".join(random.sample("0123456789abcdef", 16))
-
-    @staticmethod
-    def md5(s):
-        return hashlib.md5(s.encode()).hexdigest()
-
-    def get_sign(self, params: dict):
-        """生成官方必填签名"""
-        items = sorted(params.items())
-        raw = "".join([f"{k}{v}" for k, v in items]) + self.APP_SECRET
-        return self.md5(raw)
-
-    def login(self, account, pwd):
-        """新版合规登录接口"""
-        try:
-            url = f"{self.BASE_URL}/v2/auth/login"
-            params = {
-                "account": account,
-                "password": self.md5(pwd),
-                "deviceId": self.device_id,
-                "deviceType": 1,
-                "appKey": self.APP_KEY,
-                "timestamp": int(time.time() * 1000)
-            }
-            params["sign"] = self.get_sign(params)
-            res = self.session.post(url, data=params, headers=self.headers, timeout=30)
-            data = res.json()
-
-            if data.get("code") == 200:
-                self.access_token = data["data"]["accessToken"]
-                self.user_id = data["data"]["userId"]
-                logger.info("✅ Zepp 官方登录成功")
-                return True
-            else:
-                msg = data.get("msg", "无返回信息")
-                logger.error(f"❌ 登录失败：{msg}")
-                return False
-        except Exception as e:
-            logger.error(f"❌ 登录异常：{str(e)}")
-            return False
-
-    def upload_step(self, steps):
-        """步数上报 完整参数"""
-        try:
-            today = datetime.now().strftime("%Y-%m-%d")
-            distance = round(steps * 0.68 / 1000, 2)
-            calorie = round(steps * 0.038, 2)
-
-            step_list = [{
-                "date": today,
-                "steps": steps,
-                "distance": distance,
-                "calories": calorie,
-                "heartRate": 0
-            }]
-
-            url = f"{self.BASE_URL}/v1/step/upload"
-            payload = {
-                "userid": self.user_id,
-                "access_token": self.access_token,
-                "deviceid": self.device_id,
-                "device_type": 1,
-                "data_json": json.dumps(step_list, ensure_ascii=False)
-            }
-            res = self.session.post(url, json=payload, headers={
-                "User-Agent": "ZeppLife/7.10.0",
-                "Content-Type": "application/json"
-            }, timeout=30)
-            ret = res.json()
-            if ret.get("code") == 200:
-                logger.info(f"✅ 步数提交成功：{steps}")
-                return True
-            else:
-                logger.error(f"❌ 步数提交失败：{ret.get('msg')}")
-                return False
-        except Exception as e:
-            logger.error(f"❌ 上报异常：{str(e)}")
-            return False
-
-# ==================== 步数生成（不变） ====================
-def get_current_steps(account_index=0):
-    current_hour = datetime.now().hour
-    closest_hour = None
-    min_diff = float('inf')
-    for hour in STEP_RANGES:
-        diff = abs(current_hour - hour)
-        if diff < min_diff:
-            min_diff = diff
-            closest_hour = hour
-    if min_diff <= 2 and closest_hour in STEP_RANGES:
-        cfg = STEP_RANGES[closest_hour]
-        base = random.randint(cfg["min"], cfg["max"])
-        offset = random.randint(-500, 500)
-        steps = max(1000, base + offset)
-    else:
-        base = DEFAULT_STEPS
-        offset = random.randint(-1000, 1000)
-        steps = max(1000, base + offset)
-    return steps
-
-# ==================== 主程序 ====================
-def main():
-    logger.info("🎯 ZeppLife 原生新版API 任务启动")
-    if not ACCOUNTS:
-        logger.error("❌ 未读取到账号，退出")
-        exit(1)
-    success = 0
-    fail = 0
-    for idx, acc in enumerate(ACCOUNTS):
-        logger.info(f"\n---------- 处理账号：{acc['username']} ----------")
-        api = ZeppLifeApi()
-        if not api.login(acc["username"], acc["password"]):
-            fail += 1
-            continue
-        steps = get_current_steps(idx)
-        if api.upload_step(steps):
-            success += 1
+    # ================= 登录 =================
+    def login(self, username, password):
+        if username.isdigit():
+            username_type = "huami_phone"
+            username = "+86" + username
+        elif "@" in username:
+            username_type = "email"
         else:
-            fail += 1
-        if idx + 1 < len(ACCOUNTS):
-            time.sleep(6)
-    logger.info(f"\n========== 结束 ==========\n成功：{success} | 失败：{fail}")
-    exit(0 if fail == 0 else 1)
+            raise Exception("账号格式错误")
 
+        # Step1 获取 access
+        url = f"https://api-user.huami.com/registrations/{username}/tokens"
+        data = {
+            "client_id": "HuaMi",
+            "password": password,
+            "redirect_uri": "https://s3-us-west-2.amazonaws.com/hm-registration/successsignin.html",
+            "token": "access"
+        }
+
+        resp = self.session.post(url, data=data, allow_redirects=False)
+
+        location = resp.headers.get("Location", "")
+        if "access=" not in location:
+            raise Exception("登录失败")
+
+        access = location.split("access=")[-1].split("&")[0]
+
+        # Step2 换 token
+        url2 = "https://account.huami.com/v2/client/login"
+        data2 = {
+            "app_name": "com.xiaomi.hm.health",
+            "app_version": "6.3.5",
+            "code": access,
+            "country_code": "CN",
+            "device_id": "123456",
+            "device_id_type": "uuid",
+            "grant_type": "access_token",
+            "third_name": username_type
+        }
+
+        resp2 = self.session.post(url2, data=data2)
+        result = resp2.json()
+
+        if "token_info" not in result:
+            raise Exception("获取 token 失败")
+
+        return result["token_info"]["user_id"], result["token_info"]["app_token"]
+
+    # ================= 提交步数 =================
+    def submit_steps(self, user_id, app_token, steps):
+        url = "https://api-mifit-cn2.huami.com/v1/data/band_data.json"
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        now_ts = int(time.time())
+
+        data_json = [{
+            "date": today,
+            "data": [{
+                "start": 0,
+                "stop": 1439,
+                "value": steps
+            }]
+        }]
+
+        payload = {
+            "userid": user_id,
+            "last_sync_data_time": now_ts,
+            "device_type": 0,
+            "data_json": json.dumps(data_json)
+        }
+
+        headers = {
+            "apptoken": app_token,
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+
+        resp = self.session.post(url, data=payload, headers=headers)
+
+        try:
+            result = resp.json()
+        except:
+            return False, "返回解析失败"
+
+        if result.get("message") == "success":
+            return True, "提交成功"
+        else:
+            return False, str(result)
+
+# ==================== 主逻辑 ====================
+class StepSubmitter:
+
+    def get_steps(self, index):
+        hour = datetime.now().hour
+
+        closest = min(STEP_RANGES.keys(), key=lambda x: abs(x - hour))
+        config = STEP_RANGES.get(closest)
+
+        if config and abs(closest - hour) <= 2:
+            base = random.randint(config["min"], config["max"])
+        else:
+            base = DEFAULT_STEPS
+
+        return max(1000, base + random.randint(-500, 500))
+
+    def validate(self, username, password):
+        phone = r'^1[3-9]\d{9}$'
+        email = r'^[^@]+@[^@]+\.[^@]+$'
+
+        if not username or not password:
+            return False, "账号或密码为空"
+
+        if " " in password:
+            return False, "密码含空格"
+
+        if re.match(phone, username) or re.match(email, username):
+            return True, "OK"
+
+        return False, "账号格式错误"
+
+    def run(self):
+        if not ACCOUNTS:
+            logger.error("❌ 没账号")
+            return
+
+        success = 0
+        fail = 0
+
+        client = XiaomiClient()
+
+        for i, acc in enumerate(ACCOUNTS, 1):
+            logger.info(f"🔄 账号 {i}: {acc['username']}")
+
+            ok, msg = self.validate(acc["username"], acc["password"])
+            if not ok:
+                logger.error(msg)
+                fail += 1
+                continue
+
+            try:
+                steps = self.get_steps(i)
+
+                user_id, token = client.login(acc["username"], acc["password"])
+                logger.info(f"🔑 登录成功 user_id={user_id}")
+
+                ok, msg = client.submit_steps(user_id, token, steps)
+
+                if ok:
+                    success += 1
+                    logger.info(f"✅ 步数 {steps}")
+                else:
+                    fail += 1
+                    logger.error(f"❌ {msg}")
+
+            except Exception as e:
+                fail += 1
+                logger.error(f"异常: {str(e)}")
+
+            if i < len(ACCOUNTS):
+                time.sleep(5)
+
+        logger.info(f"🏁 完成 成功:{success} 失败:{fail}")
+
+# ==================== 入口 ====================
 if __name__ == "__main__":
-    main()
+    StepSubmitter().run()
