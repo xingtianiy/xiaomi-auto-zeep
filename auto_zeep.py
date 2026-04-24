@@ -1,281 +1,205 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-自动跑步步数提交脚本
-功能：自动为多个账号提交跑步步数，支持GitHub Actions定时执行
-作者：gaocaipeng
-仓库：https://github.com/gaocaipeng/xiaomi-auto-zeep
+小米运动/Zepp Life 原生官方API 刷步
+去除第三方中转、直连华米官方服务器
 """
+import requests
+import random
+import time
+import json
+import logging
+from datetime import datetime
+import os
+import hashlib
 
-import requests  # 用于发送网络请求
-import random    # 用于生成随机步数
-import time      # 用于延时等待
-import json      # 用于解析JSON响应
-import logging   # 用于记录日志
-from datetime import datetime  # 用于获取当前时间
-import os        # 用于读取环境变量
- 
-# 配置日志系统，记录脚本运行过程
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
- 
-# ==================== 账号配置部分 ====================
+
+# ==================== 账号读取(保留原逻辑) ====================
 def get_accounts_from_env():
-    """
-    从环境变量获取账号配置
-    这个函数会从GitHub Secrets中读取账号信息，确保账号安全
-    支持最多5个账号同时运行
-    """
     accounts = []
-    
-    # 循环检查环境变量中的账号配置（最多支持5个账号）
     for i in range(1, 6):
-        username = os.getenv(f'ACCOUNT{i}_USERNAME')  # 获取用户名
-        password = os.getenv(f'ACCOUNT{i}_PASSWORD')  # 获取密码
-        
-        # 如果用户名和密码都存在，就添加到账号列表
+        username = os.getenv(f'ACCOUNT{i}_USERNAME')
+        password = os.getenv(f'ACCOUNT{i}_PASSWORD')
         if username and password:
             accounts.append({"username": username, "password": password})
             logger.info(f"✅ 成功加载账号 {i}: {username}")
-    
-    # 如果没有找到任何账号配置，给出提示
     if not accounts:
-        logger.warning("⚠️  未找到任何账号配置，请检查GitHub Secrets设置")
-    
+        logger.warning("⚠️ 未找到任何账号配置")
     return accounts
 
-# 获取所有配置的账号
 ACCOUNTS = get_accounts_from_env()
- 
-# ==================== 步数生成规则 ====================
-# 根据不同的时间段，生成不同范围的步数，让数据更真实
+
+# ==================== 步数时段规则(完全保留你原有) ====================
 STEP_RANGES = {
-    8: {"min": 6000, "max": 10000},   # 早上8点：6000-10000步
-    12: {"min": 8000, "max": 14000},  # 中午12点：8000-14000步
-    16: {"min": 10000, "max": 18000}, # 下午4点：10000-18000步
-    20: {"min": 12000, "max": 22000}, # 晚上8点：12000-22000步
-    22: {"min": 15000, "max": 24000}  # 晚上10点：15000-24000步
+    8: {"min": 6000, "max": 10000},
+    12: {"min": 8000, "max": 14000},
+    16: {"min": 10000, "max": 18000},
+    20: {"min": 12000, "max": 22000},
+    22: {"min": 15000, "max": 24000}
 }
- 
-# 默认步数（当不在上述时间段时使用）
 DEFAULT_STEPS = 24465
- 
-# ==================== 主要功能类 ====================
-class StepSubmitter:
-    """
-    步数提交器
-    负责处理所有与步数提交相关的操作
-    """
+
+# ==================== 原生官方API核心类 ====================
+class MiFitOfficial:
+    # 华米官方基础域名
+    BASE_URL = "https://api-mifit.huami.com/v1"
+
     def __init__(self):
-        # 创建网络请求会话
         self.session = requests.Session()
-        
-        # 设置请求头，模拟真实浏览器访问
+        # 官方标准请求头
         self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.7339.128 Safari/537.36',
-            'Accept': 'application/json, text/javascript, */*; q=0.01',
-            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-            'Origin': 'https://m.cqzz.top',
-            'Referer': 'https://m.cqzz.top/',
-            'X-Requested-With': 'XMLHttpRequest'
+            "User-Agent": "ZeppLife/6.11.0 (Android; Mobile)",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
         }
-        
-        # 步数提交的API地址
-        self.base_url = 'https://wzz.wangzouzou.com/motion/api/motion/Xiaomi'
-         
-    def get_current_steps(self, account_index=0):
+        self.access_token = ""
+        self.user_id = ""
+        self.device_id = self.gen_device_id()
+
+    @staticmethod
+    def gen_device_id():
+        """随机生成设备ID，模拟真实手机"""
+        return "".join(random.choice("0123456789abcdef") for _ in range(16))
+
+    @staticmethod
+    def md5(pwd):
+        """官方密码MD5加密规则"""
+        return hashlib.md5(pwd.encode("utf-8")).hexdigest()
+
+    def login(self, account, pwd):
         """
-        根据当前时间智能生成步数
-        让生成的步数更符合真实情况
-        每个账号的步数都会有所不同
-        """
-        current_hour = datetime.now().hour
-        logger.info(f"🕐 当前时间: {datetime.now()}, 小时: {current_hour}")
-         
-        # 寻找最接近的配置时间段
-        closest_hour = None
-        min_diff = float('inf')
-         
-        # 遍历所有配置的时间点，找到最接近当前时间的
-        for hour in STEP_RANGES.keys():
-            diff = abs(current_hour - hour)
-            if diff < min_diff:
-                min_diff = diff
-                closest_hour = hour
-         
-        # 如果找到接近的配置且在合理范围内（2小时内），使用该配置
-        if min_diff <= 2 and closest_hour in STEP_RANGES:
-            step_config = STEP_RANGES[closest_hour]
-            # 为每个账号添加不同的随机偏移，让步数更真实
-            base_steps = random.randint(step_config['min'], step_config['max'])
-            # 根据账号索引添加不同的偏移量（-500到+500步）
-            offset = random.randint(-500, 500)
-            steps = max(1000, base_steps + offset)  # 确保步数不少于1000
-            logger.info(f"✅ 使用 {closest_hour} 点配置，账号{account_index+1}生成步数: {steps}")
-        else:
-            # 默认步数也添加账号差异
-            base_steps = DEFAULT_STEPS
-            offset = random.randint(-1000, 1000)  # 默认步数的偏移范围更大
-            steps = max(1000, base_steps + offset)
-            logger.info(f"✅ 使用默认步数，账号{account_index+1}生成步数: {steps}")
-         
-        return steps
-     
-    def validate_credentials(self, username, password):
-        """
-        验证账号密码格式
-        确保账号和密码符合基本要求
-        """
-        import re
-         
-        # 手机号格式验证（中国大陆手机号）
-        phone_pattern = r'^1[3-9]\d{9}$'
-        # 邮箱格式验证
-        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-         
-        # 检查账号和密码是否为空
-        if not username or not password:
-            return False, "❌ 账号或密码不能为空"
-         
-        # 检查密码是否包含空格
-        if ' ' in password:
-            return False, "❌ 密码不能包含空格"
-         
-        # 验证账号格式（手机号或邮箱）
-        if re.match(phone_pattern, username) or re.match(email_pattern, username):
-            return True, "✅ 账号格式验证通过"
-        else:
-            return False, "❌ 账号格式错误（需要是手机号或邮箱）"
-     
-    def submit_steps(self, username, password, steps):
-        """
-        提交步数到服务器
-        这是核心功能，负责将步数数据发送到目标服务器
+        原生官方登录接口
+        接口: POST /v1/auth/login
         """
         try:
-            # 第一步：验证账号密码格式
-            is_valid, message = self.validate_credentials(username, password)
-            if not is_valid:
-                return False, f"❌ 验证失败: {message}"
-             
-            # 第二步：准备要发送的数据
-            data = {
-                'phone': username,    # 账号（手机号或邮箱）
-                'pwd': password,      # 密码
-                'num': steps         # 步数
+            url = f"{self.BASE_URL}/auth/login"
+            payload = {
+                "account": account,
+                "password": self.md5(pwd),
+                "deviceId": self.device_id,
+                "deviceType": 1
             }
-             
-            logger.info(f"🚀 准备提交 - 账号: {username}, 步数: {steps}")
-             
-            # 第三步：发送网络请求
-            response = self.session.post(
-                self.base_url,
-                data=data,
-                headers=self.headers,
-                timeout=30  # 30秒超时
-            )
-             
-            # 第四步：处理服务器响应
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('code') == 200:
-                    return True, f"✅ 提交成功! 步数: {steps}"
-                else:
-                    error_msg = result.get('data', '未知错误')
-                    # 处理频繁提交的情况
-                    if '频繁' in error_msg:
-                        return False, "⏰ 提交过于频繁，请稍后再试"
-                    else:
-                        return False, f"❌ 提交失败: {error_msg}"
+            res = self.session.post(url, json=payload, headers=self.headers, timeout=30)
+            data = res.json()
+
+            if data.get("code") == 200:
+                self.access_token = data["data"]["accessToken"]
+                self.user_id = data["data"]["userId"]
+                logger.info("✅ 官方账号登录成功")
+                return True
             else:
-                return False, f"❌ 网络错误: {response.status_code}"
-                 
-        except requests.exceptions.RequestException as e:
-            return False, f"❌ 网络请求错误: {str(e)}"
-        except json.JSONDecodeError:
-            return False, "❌ 服务器响应格式错误"
+                logger.error(f"❌ 登录失败: {data.get('msg')}")
+                return False
         except Exception as e:
-            return False, f"❌ 未知错误: {str(e)}"
-     
-    def run(self):
+            logger.error(f"❌ 登录请求异常: {str(e)}")
+            return False
+
+    def upload_step(self, steps):
         """
-        主执行函数
-        这是脚本的核心入口，负责处理所有账号的步数提交
+        原生步数上报接口
+        接口: POST /v1/step/upload
         """
-        logger.info("🎯 开始执行步数提交任务")
-        
-        # 检查是否有账号配置
-        if not ACCOUNTS:
-            logger.error("❌ 没有找到任何账号配置，请检查GitHub Secrets设置")
-            return 0, 0
-            
-        logger.info(f"📊 共有 {len(ACCOUNTS)} 个账号需要处理")
-         
-        success_count = 0  # 成功提交的账号数量
-        fail_count = 0     # 提交失败的账号数量
-         
-        # 逐个处理每个账号
-        for i, account in enumerate(ACCOUNTS, 1):
-            logger.info(f"🔄 处理第 {i}/{len(ACCOUNTS)} 个账号: {account['username']}")
-             
-            try:
-                # 获取当前应提交的步数（传入账号索引，让每个账号步数不同）
-                steps = self.get_current_steps(i - 1)
-                 
-                # 提交步数到服务器
-                success, message = self.submit_steps(
-                    account['username'], 
-                    account['password'], 
-                    steps
-                )
-                 
-                if success:
-                    success_count += 1
-                    logger.info(f"✅ 账号 {account['username']} - {message}")
-                else:
-                    fail_count += 1
-                    logger.error(f"❌ 账号 {account['username']} - {message}")
-                 
-            except Exception as e:
-                fail_count += 1
-                logger.error(f"❌ 账号 {account['username']} - 处理异常: {str(e)}")
-             
-            # 账号间间隔（避免请求过于频繁）
-            if i < len(ACCOUNTS):
-                logger.info("⏳ 等待5秒后处理下一个账号...")
-                time.sleep(5)
-         
-        # 输出最终结果
-        logger.info(f"🏁 任务完成! 成功: {success_count}, 失败: {fail_count}")
-         
-        return success_count, fail_count
- 
-# ==================== 程序入口 ====================
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            # 换算简易卡路里、距离(官方必填字段)
+            distance = round(steps * 0.7 / 1000, 2)
+            calorie = round(steps * 0.04, 2)
+
+            step_data = [{
+                "date": today,
+                "steps": steps,
+                "distance": distance,
+                "calories": calorie
+            }]
+
+            url = f"{self.BASE_URL}/step/upload"
+            payload = {
+                "userid": self.user_id,
+                "access_token": self.access_token,
+                "deviceid": self.device_id,
+                "device_type": 1,
+                "data_json": json.dumps(step_data)
+            }
+
+            res = self.session.post(url, json=payload, headers=self.headers, timeout=30)
+            data = res.json()
+
+            if data.get("code") == 200:
+                logger.info(f"✅ 原生API步数上报成功｜步数:{steps}")
+                return True
+            else:
+                logger.error(f"❌ 步数上报失败: {data.get('msg')}")
+                return False
+        except Exception as e:
+            logger.error(f"❌ 上报请求异常: {str(e)}")
+            return False
+
+# ==================== 保留你的智能步数生成逻辑 ====================
+def get_current_steps(account_index=0):
+    current_hour = datetime.now().hour
+    logger.info(f"🕐 当前小时: {current_hour}")
+    closest_hour = None
+    min_diff = float('inf')
+
+    for hour in STEP_RANGES.keys():
+        diff = abs(current_hour - hour)
+        if diff < min_diff:
+            min_diff = diff
+            closest_hour = hour
+
+    if min_diff <= 2 and closest_hour in STEP_RANGES:
+        cfg = STEP_RANGES[closest_hour]
+        base = random.randint(cfg["min"], cfg["max"])
+        offset = random.randint(-500, 500)
+        steps = max(1000, base + offset)
+    else:
+        base = DEFAULT_STEPS
+        offset = random.randint(-1000, 1000)
+        steps = max(1000, base + offset)
+    return steps
+
+# ==================== 主运行逻辑 ====================
 def main():
-    """
-    主函数
-    这是程序的入口点，负责启动整个步数提交流程
-    """
-    try:
-        # 创建步数提交器实例
-        submitter = StepSubmitter()
-        
-        # 执行步数提交任务
-        success_count, fail_count = submitter.run()
-         
-        # 根据执行结果返回相应的退出码
-        if fail_count == 0:
-            print("🎉 所有账号提交成功!")
-            exit(0)  # 成功退出
+    logger.info("🎯 【Zepp Life 原生官方API 刷步任务启动】")
+    if not ACCOUNTS:
+        logger.error("❌ 无账号配置，退出")
+        exit(1)
+
+    success_count = 0
+    fail_count = 0
+
+    for idx, acc in enumerate(ACCOUNTS):
+        username = acc["username"]
+        pwd = acc["password"]
+        logger.info(f"\n---------- 开始处理账号: {username} ----------")
+
+        # 初始化官方API实例
+        client = MiFitOfficial()
+        # 1.登录
+        if not client.login(username, pwd):
+            fail_count += 1
+            continue
+        # 2.生成步数
+        steps = get_current_steps(idx)
+        logger.info(f"🔢 本次上报步数: {steps}")
+        # 3.上报步数
+        if client.upload_step(steps):
+            success_count += 1
         else:
-            print(f"⚠️  部分账号提交失败，成功: {success_count}, 失败: {fail_count}")
-            exit(1)  # 失败退出
-             
-    except Exception as e:
-        logger.error(f"💥 脚本执行异常: {str(e)}")
-        exit(1)  # 异常退出
- 
-# 程序启动点
+            fail_count += 1
+
+        # 账号间隔
+        if idx + 1 < len(ACCOUNTS):
+            time.sleep(5)
+
+    logger.info(f"\n========== 任务结束 ==========")
+    logger.info(f"✅ 成功:{success_count}  ❌ 失败:{fail_count}")
+    if fail_count == 0:
+        exit(0)
+    else:
+        exit(1)
+
 if __name__ == "__main__":
     main()
